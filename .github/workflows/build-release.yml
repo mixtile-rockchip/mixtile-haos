@@ -1,0 +1,34 @@
+name: Build Mixtile Edge 2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Build Mixtile Edge 2 image
+        run: scripts/build_edge2.sh
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: mixtile-edge2-images
+          path: |
+            output/images/*.img.xz
+            output/images/*.raucb
+

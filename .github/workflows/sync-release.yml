@@ -1,0 +1,74 @@
+name: Check upstream HAOS release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "25 3 * * *"
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          submodules: recursive
+
+      - name: Resolve current and latest release
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_tag="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
+          latest_tag="$(gh api repos/home-assistant/operating-system/releases/latest --jq '.tag_name')"
+          echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create reminder issue when upstream moved
+        if: ${{ steps.versions.outputs.current_tag != steps.versions.outputs.latest_tag }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          CURRENT_TAG: ${{ steps.versions.outputs.current_tag }}
+          LATEST_TAG: ${{ steps.versions.outputs.latest_tag }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = `Sync HAOS ${process.env.LATEST_TAG}`;
+            const body = [
+              `Current pinned HAOS tag: \`${process.env.CURRENT_TAG || "unversioned"}\``,
+              `Latest upstream HAOS tag: \`${process.env.LATEST_TAG}\``,
+              ``,
+              `Run \`scripts/sync_haos_release.sh ${process.env.LATEST_TAG}\`, rebuild Mixtile Edge 2, and commit the updated submodule pointer.`,
+            ].join("\n");
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: "open",
+              per_page: 100,
+            });
+
+            if (issues.some((issue) => issue.title === title)) {
+              core.notice(`Issue already open: ${title}`);
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+            });
+
+      - name: Write summary
+        run: |
+          {
+            echo "# HAOS release check"
+            echo ""
+            echo "- Pinned tag: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
+            echo "- Latest upstream tag: \`${{ steps.versions.outputs.latest_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
