@@ -1,4 +1,4 @@
-name: Check upstream HAOS release
+name: Sync latest HAOS release
 
 on:
   workflow_dispatch:
@@ -15,6 +15,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
         with:
+          ref: main
           submodules: recursive
 
       - name: Resolve current and latest release
@@ -37,12 +38,19 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const title = `Sync HAOS ${process.env.LATEST_TAG}`;
+            const latestTag = process.env.LATEST_TAG;
+            const title = `Sync HAOS ${latestTag}`;
+            const releaseTag = `mixtile-haos-${latestTag}-r1`;
             const body = [
-              `Current pinned HAOS tag: \`${process.env.CURRENT_TAG || "unversioned"}\``,
-              `Latest upstream HAOS tag: \`${process.env.LATEST_TAG}\``,
+              `Current pinned HAOS tag on \`main\`: \`${process.env.CURRENT_TAG || "unversioned"}\``,
+              `Latest upstream HAOS tag: \`${latestTag}\``,
               ``,
-              `Update the \`haos/\` submodule to \`${process.env.LATEST_TAG}\`, rerun the Mixtile Edge 2 build workflow, and commit the updated submodule pointer.`,
+              `Required follow-up on \`main\`:`,
+              `1. Update the \`haos/\` submodule to \`${latestTag}\`.`,
+              `2. Adapt and validate Mixtile Edge 2 on \`main\`.`,
+              `3. Run the \`Build Mixtile Edge 2\` workflow with \`git_ref=main\` and \`release_tag=${releaseTag}\`.`,
+              ``,
+              `This repository only tracks the latest stable HAOS line on \`main\`. Historical major backfills belong on temporary \`port/<version>\` branches.`,
             ].join("\n");
 
             const { data: issues } = await github.rest.issues.listForRepo({
@@ -69,6 +77,7 @@ jobs:
           {
             echo "# HAOS release check"
             echo ""
-            echo "- Pinned tag: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
+            echo "- Default line: \`main\`"
+            echo "- Pinned tag on main: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
             echo "- Latest upstream tag: \`${{ steps.versions.outputs.latest_tag }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

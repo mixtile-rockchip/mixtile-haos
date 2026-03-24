@@ -1,0 +1,100 @@
+name: Backfill major release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Historical HAOS major target; the matching port/<version> branch must already exist on origin
+        required: true
+        type: choice
+        options:
+          - "11.5"
+          - "12.4"
+          - "13.2"
+          - "14.2"
+          - "15.2"
+          - "16.3"
+          - "17.1"
+      revision:
+        description: Release revision number for the selected HAOS version
+        required: true
+        type: string
+        default: "1"
+      force:
+        description: Rebuild even if the GitHub Release already exists
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Resolve backfill inputs
+        id: release
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          echo "git_ref=port/${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=mixtile-haos-${VERSION}-r${REVISION}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate source branch exists
+        shell: bash
+        env:
+          GIT_REF: ${{ steps.release.outputs.git_ref }}
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "${GIT_REF}" >/dev/null
+
+      - name: Check existing release
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch build workflow
+        if: ${{ steps.existing.outputs.should_dispatch == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_REF: ${{ steps.release.outputs.git_ref }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-release.yml \
+            --ref main \
+            -f git_ref="${GIT_REF}" \
+            -f release_tag="${RELEASE_TAG}"
+
+      - name: Write summary
+        run: |
+          {
+            echo "# Backfill summary"
+            echo ""
+            echo "- Version: \`${{ inputs.version }}\`"
+            echo "- Source branch: \`${{ steps.release.outputs.git_ref }}\`"
+            echo "- Release tag: \`${{ steps.release.outputs.release_tag }}\`"
+            echo "- Force rebuild: \`${{ inputs.force }}\`"
+            echo "- Dispatched: \`${{ steps.existing.outputs.should_dispatch == 'true' }}\`"
+            echo "- Requirement: prepare and push \`${{ steps.release.outputs.git_ref }}\` before running this workflow"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -2,22 +2,122 @@ name: Build Mixtile Edge 2
 
 on:
   workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git ref to build (main, port/<version>, or an immutable tag)
+        required: true
+        type: string
+        default: main
+      release_tag:
+        description: Optional GitHub Release tag in mixtile-haos-<version>-rN format
+        required: false
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+      contents: write
     env:
       BR2_EXTERNAL_PATH: /build/haos/buildroot-external:/build/external
     steps:
       - name: Checkout source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
         with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
           submodules: recursive
 
       - name: Ensure submodules
         run: git submodule update --init --recursive
+
+      - name: Resolve source metadata
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git rev-parse HEAD)"
+          haos_version="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "haos_version=${haos_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag format
+        if: ${{ inputs.release_tag != '' }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          HAOS_VERSION: ${{ steps.source.outputs.haos_version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HAOS_VERSION}" ]]; then
+            echo "Release builds require haos/ to be pinned to an exact upstream HAOS tag." >&2
+            exit 1
+          fi
+
+          expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
+          if [[ ! "${RELEASE_TAG}" =~ ${expected_pattern} ]]; then
+            echo "release_tag must match ${expected_pattern}" >&2
+            exit 1
+          fi
+
+      - name: Create or update draft release
+        if: ${{ inputs.release_tag != '' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          GIT_REF: ${{ inputs.git_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          HAOS_VERSION: ${{ steps.source.outputs.haos_version }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const sourceSha = process.env.SOURCE_SHA;
+            const gitRef = process.env.GIT_REF;
+            const haosVersion = process.env.HAOS_VERSION;
+            const body = [
+              `Mixtile HAOS release for HAOS ${haosVersion}.`,
+              ``,
+              `Git ref: \`${gitRef}\``,
+              `Source commit: \`${sourceSha}\``,
+              `Upstream HAOS tag pinned in \`haos/\`: \`${haosVersion}\``,
+              ``,
+              `This release stays as a draft until the image is validated on Mixtile Edge 2.`,
+            ].join("\n");
+
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: data.id,
+                tag_name: tag,
+                target_commitish: sourceSha,
+                name: tag,
+                body,
+                draft: true,
+                prerelease: false,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: sourceSha,
+                name: tag,
+                body,
+                draft: true,
+                prerelease: false,
+                generate_release_notes: false,
+              });
+            }
 
       - name: Free disk space
         run: |
@@ -66,3 +166,13 @@ jobs:
           path: |
             output/images/*.img.xz
             output/images/*.raucb
+
+      - name: Upload release assets
+        if: ${{ inputs.release_tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "${RELEASE_TAG}" output/images/*.img.xz output/images/*.raucb --clobber
