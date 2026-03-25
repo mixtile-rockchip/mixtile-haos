@@ -4,17 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Historical HAOS major target; the matching port/<version> branch must already exist on origin
+        description: Historical HAOS version from .github/major-targets.json
         required: true
-        type: choice
-        options:
-          - "11.5"
-          - "12.4"
-          - "13.2"
-          - "14.2"
-          - "15.2"
-          - "16.3"
-          - "17.1"
+        type: string
 
 jobs:
   validate:
@@ -23,6 +15,13 @@ jobs:
       actions: write
       contents: read
     steps:
+      - name: Checkout control repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Resolve backfill inputs
         id: release
         shell: bash
@@ -30,30 +29,36 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          echo "git_ref=port/${VERSION}" >> "$GITHUB_OUTPUT"
+
+          family="$(
+            python3 -c 'import json, os; version = os.environ["VERSION"].strip(); targets = json.load(open(".github/major-targets.json", "r", encoding="utf-8"))["historical_targets"]; matches = [item["family"] for item in targets if item["version"] == version]; print(matches[0]) if matches else (_ for _ in ()).throw(SystemExit(f"Unsupported historical target: {version}"))'
+          )"
+
+          echo "source_ref=port/${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "family=${family}" >> "$GITHUB_OUTPUT"
 
       - name: Validate source branch exists
         shell: bash
         env:
-          GIT_REF: ${{ steps.release.outputs.git_ref }}
+          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
         run: |
           set -euo pipefail
-          git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "${GIT_REF}" >/dev/null
+          git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "${SOURCE_REF}" >/dev/null
 
       - name: Dispatch build workflow
         id: dispatch
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          GIT_REF: ${{ steps.release.outputs.git_ref }}
+          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
         run: |
           set -euo pipefail
           dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
           gh workflow run build.yml \
             --ref main \
-            -f git_ref="${GIT_REF}" \
-            -f publish=false
+            -f source_ref="${SOURCE_REF}" \
+            -f publish_to_release=false
 
           run_id=""
           for _ in $(seq 1 30); do
@@ -100,9 +105,8 @@ jobs:
             echo "# Backfill validation summary"
             echo ""
             echo "- Version: \`${{ inputs.version }}\`"
-            echo "- Source branch: \`${{ steps.release.outputs.git_ref }}\`"
-            echo "- Dispatched: \`true\`"
+            echo "- Family: \`${{ steps.release.outputs.family }}\`"
+            echo "- Source ref: \`${{ steps.release.outputs.source_ref }}\`"
             echo "- Validation run id: \`${{ steps.dispatch.outputs.run_id || 'n/a' }}\`"
             echo "- Validation status: \`${{ steps.result.outputs.status || 'failed' }}\`"
-            echo "- Requirement: prepare and push \`${{ steps.release.outputs.git_ref }}\` before running this workflow"
           } >> "$GITHUB_STEP_SUMMARY"

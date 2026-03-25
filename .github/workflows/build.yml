@@ -1,21 +1,23 @@
 name: Build Mixtile Edge 2
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
-      git_ref:
-        description: Git ref to build (main, port/<version>, or a release tag)
+      source_ref:
+        description: Git ref to build from source/ (main, sync/<version>, port/<version>, or a release tag)
         required: true
         type: string
         default: main
-      publish:
-        description: Upload assets to an existing GitHub Release for the selected tag
+      publish_to_release:
+        description: Upload assets to an existing draft GitHub Release
         required: true
         type: boolean
         default: false
+      release_tag:
+        description: Required when publish_to_release=true; must match mixtile-haos-<haos-version>-rN
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: mixtile-haos-build
@@ -34,89 +36,99 @@ jobs:
       haos_version: ${{ steps.source.outputs.haos_version }}
       haos_major: ${{ steps.source.outputs.haos_major }}
       publish_build: ${{ steps.publish.outputs.publish_build }}
+      release_tag: ${{ steps.publish.outputs.release_tag }}
       release_upload_url: ${{ steps.publish.outputs.release_upload_url }}
       build_container_image: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder@${{ steps.build_builder.outputs.digest }}
     steps:
-      - name: Checkout source
+      - name: Checkout control repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.git_ref }}
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout build source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          path: source
           persist-credentials: false
           submodules: recursive
 
       - name: Resolve source metadata
         id: source
         shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            source_ref="${{ github.event.release.tag_name }}"
-          else
-            source_ref="${{ inputs.git_ref }}"
-          fi
+          git -C source/haos fetch --tags --force origin
 
-          source_sha="$(git rev-parse HEAD)"
-          haos_version="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
+          source_sha="$(git -C source rev-parse HEAD)"
+          haos_version="$(git -C source/haos describe --tags --exact-match 2>/dev/null || true)"
           if [[ -z "${haos_version}" ]]; then
-            echo "haos/ must be pinned to an exact upstream HAOS release tag." >&2
+            echo "source/haos must be pinned to an exact upstream HAOS release tag." >&2
             exit 1
           fi
 
-          haos_major="${haos_version%%.*}"
+          if [[ ! "${haos_version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "Only stable HAOS release tags are supported. Ref resolved to ${haos_version}." >&2
+            exit 1
+          fi
 
-          echo "source_ref=${source_ref}" >> "$GITHUB_OUTPUT"
+          echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
           echo "haos_version=${haos_version}" >> "$GITHUB_OUTPUT"
-          echo "haos_major=${haos_major}" >> "$GITHUB_OUTPUT"
+          echo "haos_major=${haos_version%%.*}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve publish mode
         id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLISH_TO_RELEASE: ${{ inputs.publish_to_release }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ steps.source.outputs.source_ref }}
           HAOS_VERSION: ${{ steps.source.outputs.haos_version }}
         run: |
           set -euo pipefail
 
-          release_upload_url=""
-
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
-            if [[ ! "${SOURCE_REF}" =~ ${expected_pattern} ]]; then
-              echo "Release tag ${SOURCE_REF} does not match ${expected_pattern}." >&2
-              exit 1
-            fi
-
-            echo "publish_build=true" >> "$GITHUB_OUTPUT"
-            echo "release_upload_url=${{ github.event.release.upload_url }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "${{ inputs.publish }}" != "true" ]]; then
+          if [[ "${PUBLISH_TO_RELEASE}" != "true" ]]; then
             echo "publish_build=false" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
             echo "release_upload_url=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
-          if [[ ! "${SOURCE_REF}" =~ ${expected_pattern} ]]; then
-            echo "Manual publish requires a release tag matching ${expected_pattern}." >&2
+          if [[ -z "${RELEASE_TAG}" ]]; then
+            echo "release_tag is required when publish_to_release=true." >&2
             exit 1
           fi
 
-          release_upload_url="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_REF}" --jq '.upload_url'
-          )"
+          expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
+          if [[ ! "${RELEASE_TAG}" =~ ${expected_pattern} ]]; then
+            echo "release_tag must match ${expected_pattern}." >&2
+            exit 1
+          fi
 
-          if [[ -z "${release_upload_url}" || "${release_upload_url}" == "null" ]]; then
-            echo "Unable to resolve release upload URL for ${SOURCE_REF}." >&2
+          if [[ "${SOURCE_REF}" != "${RELEASE_TAG}" ]]; then
+            echo "publish_to_release requires source_ref to be the immutable release tag ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          release_upload_url="$(jq -r '.upload_url' <<<"${release_json}")"
+          release_draft="$(jq -r '.draft' <<<"${release_json}")"
+
+          if [[ "${release_draft}" != "true" ]]; then
+            echo "Release ${RELEASE_TAG} must still be a draft while assets are being uploaded." >&2
             exit 1
           fi
 
           echo "publish_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "release_upload_url=${release_upload_url}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -133,8 +145,8 @@ jobs:
         id: build_builder
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
-          context: ./haos
-          file: ./haos/Dockerfile
+          context: ./source/haos
+          file: ./source/haos/Dockerfile
           tags: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder
           cache-from: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder:cache-${{ steps.source.outputs.haos_major }}
           cache-to: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder:cache-${{ steps.source.outputs.haos_major }}
@@ -147,23 +159,30 @@ jobs:
     permissions:
       contents: write
     env:
-      BR2_EXTERNAL_PATH: /build/haos/buildroot-external:/build/external
       BUILD_CONFIG_COMMAND: >-
-        make -C /build/haos/buildroot
+        make -C /build/source/haos/buildroot
         O=/build/output
-        BR2_EXTERNAL=/build/haos/buildroot-external:/build/external
+        BR2_EXTERNAL=/build/source/haos/buildroot-external:/build/source/external
         mixtile_edge2_defconfig
       BUILD_COMMAND: >-
-        make -C /build/haos/buildroot
+        make -C /build/source/haos/buildroot
         O=/build/output
-        BR2_EXTERNAL=/build/haos/buildroot-external:/build/external
+        BR2_EXTERNAL=/build/source/haos/buildroot-external:/build/source/external
         BR2_JLEVEL=2
     steps:
-      - name: Checkout source
+      - name: Checkout control repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout build source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.prepare.outputs.source_ref }}
           fetch-depth: 0
+          path: source
           persist-credentials: false
           submodules: recursive
 
@@ -190,7 +209,7 @@ jobs:
           path: /mnt/cache/cc
           key: mixtile-haos-cc-${{ needs.prepare.outputs.haos_version }}
           restore-keys: |
-            mixtile-haos-cc-${{ needs.prepare.outputs.haos_major }}.
+            mixtile-haos-cc-${{ needs.prepare.outputs.haos_major }}-
             mixtile-haos-cc-
 
       - name: Generate build config
@@ -206,6 +225,7 @@ jobs:
           command: ${{ env.BUILD_COMMAND }}
 
       - name: Print cache stats
+        if: ${{ success() }}
         shell: bash
         run: |
           set -euo pipefail
@@ -225,24 +245,46 @@ jobs:
           path: /mnt/cache/cc
           key: mixtile-haos-cc-${{ needs.prepare.outputs.haos_version }}-${{ github.run_id }}
 
+      - name: Remove stale draft assets
+        if: ${{ success() && needs.prepare.outputs.publish_build == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name' | while IFS= read -r asset_name; do
+            case "${asset_name}" in
+              *.img.xz|*.raucb)
+                gh release delete-asset "${RELEASE_TAG}" "${asset_name}" --yes
+                ;;
+            esac
+          done
+
       - name: Generate build summary
         if: ${{ success() }}
         shell: bash
         env:
-          GIT_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           HAOS_VERSION: ${{ needs.prepare.outputs.haos_version }}
           PUBLISH_BUILD: ${{ needs.prepare.outputs.publish_build }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
 
           {
             echo "# Mixtile Edge 2 build summary"
             echo ""
-            echo "- Git ref: \`${GIT_REF}\`"
+            echo "- Control branch: \`main\`"
+            echo "- Source ref: \`${SOURCE_REF}\`"
             echo "- Source SHA: \`${SOURCE_SHA}\`"
             echo "- HAOS version: \`${HAOS_VERSION}\`"
             echo "- Publish build: \`${PUBLISH_BUILD}\`"
+            if [[ -n "${RELEASE_TAG}" ]]; then
+              echo "- Release tag: \`${RELEASE_TAG}\`"
+            fi
             echo ""
             echo "| File | Size (bytes) | Size (formatted) |"
             echo "|:-|:-|:-|"

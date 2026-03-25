@@ -3,22 +3,14 @@ name: Publish validated release
 on:
   workflow_dispatch:
     inputs:
-      git_ref:
-        description: Validated git ref to publish (main or port/<version>)
+      source_ref:
+        description: Validated source ref to publish (main or port/<version>)
         required: true
         type: string
       version:
-        description: HAOS version pinned in haos/
+        description: HAOS version pinned in source/haos
         required: true
-        type: choice
-        options:
-          - "11.5"
-          - "12.4"
-          - "13.2"
-          - "14.2"
-          - "15.2"
-          - "16.3"
-          - "17.1"
+        type: string
       revision:
         description: Release revision number for this HAOS version
         required: true
@@ -29,13 +21,23 @@ jobs:
   publish:
     runs-on: ubuntu-22.04
     permissions:
+      actions: write
       contents: write
     steps:
-      - name: Checkout source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - name: Checkout control repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.git_ref }}
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
           submodules: recursive
 
       - name: Validate source version
@@ -43,27 +45,38 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
-          haos_version="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
-          if [[ "${haos_version}" != "${VERSION}" ]]; then
-            echo "haos/ is pinned to ${haos_version}, expected ${VERSION}." >&2
+
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "Only stable HAOS release versions can be published: ${VERSION}." >&2
             exit 1
           fi
 
-          source_sha="$(git rev-parse HEAD)"
-          release_tag="mixtile-haos-${VERSION}-r${{ inputs.revision }}"
+          git -C source/haos fetch --tags --force origin
+
+          haos_version="$(git -C source/haos describe --tags --exact-match 2>/dev/null || true)"
+          if [[ "${haos_version}" != "${VERSION}" ]]; then
+            echo "source/haos is pinned to ${haos_version}, expected ${VERSION}." >&2
+            exit 1
+          fi
+
+          source_sha="$(git -C source rev-parse HEAD)"
+          release_tag="mixtile-haos-${VERSION}-r${REVISION}"
+
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Create tag if missing
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           existing_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}" | awk '{print $1}')"
           if [[ -n "${existing_sha}" ]]; then
             if [[ "${existing_sha}" != "${SOURCE_SHA}" ]]; then
@@ -79,10 +92,12 @@ jobs:
           git tag "${RELEASE_TAG}" "${SOURCE_SHA}"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"
 
-      - name: Create published release
+      - name: Create or update draft release
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
           VERSION: ${{ inputs.version }}
           REVISION: ${{ inputs.revision }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -90,33 +105,96 @@ jobs:
         run: |
           set -euo pipefail
 
+          notes_file="$(mktemp)"
+          {
+            printf '%s\n' "Home Assistant OS ${VERSION} for Mixtile Edge 2."
+            printf '\n'
+            printf '%s\n' "Source ref: ${SOURCE_REF}"
+            printf '%s\n' "Source commit: ${SOURCE_SHA}"
+            printf '\n'
+            printf '%s\n' "This release remains a draft until board validation is complete."
+          } > "${notes_file}"
+
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "GitHub Release ${RELEASE_TAG} already exists." >&2
+            is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq '.isDraft')"
+            if [[ "${is_draft}" != "true" ]]; then
+              echo "Release ${RELEASE_TAG} already exists and is not a draft." >&2
+              exit 1
+            fi
+
+            gh release edit "${RELEASE_TAG}" \
+              --draft \
+              --title "Mixtile HAOS ${VERSION} r${REVISION}" \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              --verify-tag \
+              --draft \
+              --target "${SOURCE_SHA}" \
+              --title "Mixtile HAOS ${VERSION} r${REVISION}" \
+              --notes-file "${notes_file}"
+          fi
+
+          echo "release_url=$(gh release view "${RELEASE_TAG}" --json url --jq '.url')" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch release build
+        id: dispatch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          gh workflow run build.yml \
+            --ref main \
+            -f source_ref="${RELEASE_TAG}" \
+            -f publish_to_release=true \
+            -f release_tag="${RELEASE_TAG}"
+
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id="$(
+              gh run list \
+                --workflow build.yml \
+                --event workflow_dispatch \
+                --limit 10 \
+                --json databaseId,createdAt \
+                --jq "map(select(.createdAt >= \"${dispatched_at}\"))[0].databaseId"
+            )"
+            if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
+            echo "Unable to resolve the release build run id." >&2
             exit 1
           fi
 
-          notes_file="$(mktemp)"
-          cat > "${notes_file}" <<EOF
-          Home Assistant OS ${VERSION} for Mixtile Edge 2.
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
 
-          Source ref: ${{ inputs.git_ref }}
-          Source commit: ${SOURCE_SHA}
-
-          Publishing this release triggers the official-style build workflow, which uploads \`.img.xz\` and \`.raucb\` assets to this release.
-          EOF
-
-          gh release create "${RELEASE_TAG}" \
-            --verify-tag \
-            --title "Mixtile HAOS ${VERSION} r${REVISION}" \
-            --notes-file "${notes_file}"
+      - name: Wait for release build result
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh run watch "${RUN_ID}" --exit-status
 
       - name: Write summary
+        if: always()
         run: |
           {
-            echo "# Release publication summary"
+            echo "# Draft release summary"
             echo ""
-            echo "- Source ref: \`${{ inputs.git_ref }}\`"
+            echo "- Source ref: \`${{ inputs.source_ref }}\`"
             echo "- Source SHA: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- Release tag: \`${{ steps.source.outputs.release_tag }}\`"
-            echo "- Next step: \`Build Mixtile Edge 2\` will start automatically from the release.published event"
+            echo "- Draft release: \`${{ steps.release.outputs.release_url || 'n/a' }}\`"
+            echo "- Build run id: \`${{ steps.dispatch.outputs.run_id || 'n/a' }}\`"
+            echo "- Next step: board-validate this draft release, then run \`Finalize release\`"
           } >> "$GITHUB_STEP_SUMMARY"

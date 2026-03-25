@@ -2,84 +2,191 @@ name: Sync latest HAOS release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Override upstream HAOS version to sync; empty means latest stable release
+        required: false
+        type: string
+        default: ""
+      force:
+        description: Force regenerating the sync/<version> branch and validate run even when main is already pinned there
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "25 3 * * *"
 
 jobs:
-  check:
+  sync:
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
-      issues: write
+      actions: write
+      contents: write
+      pull-requests: write
     steps:
-      - name: Checkout source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
+          fetch-depth: 0
+          persist-credentials: false
           submodules: recursive
 
-      - name: Resolve current and latest release
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve current and target versions
         id: versions
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
         run: |
+          set -euo pipefail
+
+          git -C haos fetch --tags --force origin
+
           current_tag="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
-          latest_tag="$(gh api repos/home-assistant/operating-system/releases/latest --jq '.tag_name')"
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            target_tag="${INPUT_VERSION}"
+          else
+            target_tag="$(gh api repos/home-assistant/operating-system/releases/latest --jq '.tag_name')"
+          fi
+
+          if [[ ! "${target_tag}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "Only stable HAOS releases are supported for sync: ${target_tag}." >&2
+            exit 1
+          fi
+
+          should_sync="false"
+          if [[ "${FORCE}" == "true" || "${current_tag}" != "${target_tag}" ]]; then
+            should_sync="true"
+          fi
+
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "target_tag=${target_tag}" >> "$GITHUB_OUTPUT"
+          echo "sync_branch=sync/${target_tag}" >> "$GITHUB_OUTPUT"
+          echo "should_sync=${should_sync}" >> "$GITHUB_OUTPUT"
 
-      - name: Create reminder issue when upstream moved
-        if: ${{ steps.versions.outputs.current_tag != steps.versions.outputs.latest_tag }}
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      - name: Prepare sync branch
+        if: ${{ steps.versions.outputs.should_sync == 'true' }}
+        id: branch
+        shell: bash
         env:
+          TARGET_TAG: ${{ steps.versions.outputs.target_tag }}
+          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
+        run: |
+          set -euo pipefail
+
+          git switch -C "${SYNC_BRANCH}" main
+          git -C haos fetch --tags --force origin
+          git -C haos checkout "${TARGET_TAG}"
+          git add haos
+
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Sync HAOS ${TARGET_TAG}"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch
+        if: ${{ steps.versions.outputs.should_sync == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
+        run: |
+          set -euo pipefail
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${SYNC_BRANCH}" --force-with-lease
+
+      - name: Dispatch validation build
+        if: ${{ steps.versions.outputs.should_sync == 'true' }}
+        id: dispatch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
+        run: |
+          set -euo pipefail
+          dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          gh workflow run build.yml \
+            --ref main \
+            -f source_ref="${SYNC_BRANCH}" \
+            -f publish_to_release=false
+
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id="$(
+              gh run list \
+                --workflow build.yml \
+                --event workflow_dispatch \
+                --limit 10 \
+                --json databaseId,createdAt \
+                --jq "map(select(.createdAt >= \"${dispatched_at}\"))[0].databaseId"
+            )"
+            if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
+            echo "Unable to resolve the validation run id." >&2
+            exit 1
+          fi
+
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "run_url=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: ${{ steps.versions.outputs.should_sync == 'true' && steps.branch.outputs.has_changes == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
           CURRENT_TAG: ${{ steps.versions.outputs.current_tag }}
-          LATEST_TAG: ${{ steps.versions.outputs.latest_tag }}
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const latestTag = process.env.LATEST_TAG;
-            const title = `Sync HAOS ${latestTag}`;
-            const releaseTag = `mixtile-haos-${latestTag}-r1`;
-            const body = [
-              `Current pinned HAOS tag on \`main\`: \`${process.env.CURRENT_TAG || "unversioned"}\``,
-              `Latest upstream HAOS tag: \`${latestTag}\``,
-              ``,
-              `Required follow-up on \`main\`:`,
-              `1. Update the \`haos/\` submodule to \`${latestTag}\`.`,
-              `2. Adapt and validate Mixtile Edge 2 on \`main\`.`,
-              `3. Run the \`Build Mixtile Edge 2\` workflow with \`git_ref=main\` and \`publish=false\`.`,
-              `4. After validation succeeds, run \`Publish validated release\` for \`main\` with \`version=${latestTag}\` and \`revision=1\`.`,
-              `5. The published GitHub Release will automatically trigger the release build and upload \`.img.xz\` / \`.raucb\` assets.`,
-              ``,
-              `This repository only tracks the latest stable HAOS line on \`main\`. Historical major backfills belong on temporary \`port/<version>\` branches.`,
-            ].join("\n");
+          TARGET_TAG: ${{ steps.versions.outputs.target_tag }}
+          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          set -euo pipefail
 
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner,
-              repo,
-              state: "open",
-              per_page: 100,
-            });
+          body_file="$(mktemp)"
+          {
+            printf '%s\n' "Automated HAOS sync candidate for ${TARGET_TAG}."
+            printf '\n'
+            printf '%s\n' "Current main HAOS tag: ${CURRENT_TAG:-unversioned}"
+            printf '%s\n' "Proposed HAOS tag: ${TARGET_TAG}"
+            printf '%s\n' "Validate run: ${RUN_URL}"
+            printf '\n'
+            printf '%s\n' "Merge this PR only after the validate build succeeds and any required Mixtile Edge 2 adjustments are applied."
+          } > "${body_file}"
 
-            if (issues.some((issue) => issue.title === title)) {
-              core.notice(`Issue already open: ${title}`);
-              return;
-            }
-
-            await github.rest.issues.create({
-              owner,
-              repo,
-              title,
-              body,
-            });
+          existing_pr="$(gh pr list --base main --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number')"
+          if [[ -n "${existing_pr}" && "${existing_pr}" != "null" ]]; then
+            gh pr edit "${existing_pr}" \
+              --title "Sync HAOS ${TARGET_TAG}" \
+              --body-file "${body_file}"
+          else
+            gh pr create \
+              --base main \
+              --head "${SYNC_BRANCH}" \
+              --title "Sync HAOS ${TARGET_TAG}" \
+              --body-file "${body_file}"
+          fi
 
       - name: Write summary
+        if: always()
         run: |
           {
-            echo "# HAOS release check"
+            echo "# HAOS sync summary"
             echo ""
-            echo "- Default line: \`main\`"
-            echo "- Pinned tag on main: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
-            echo "- Latest upstream tag: \`${{ steps.versions.outputs.latest_tag }}\`"
+            echo "- Current main tag: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
+            echo "- Target tag: \`${{ steps.versions.outputs.target_tag }}\`"
+            echo "- Sync branch: \`${{ steps.versions.outputs.sync_branch }}\`"
+            echo "- Triggered sync: \`${{ steps.versions.outputs.should_sync }}\`"
+            echo "- Validate run: \`${{ steps.dispatch.outputs.run_url || 'n/a' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
