@@ -29,7 +29,6 @@ jobs:
   publish:
     runs-on: ubuntu-22.04
     permissions:
-      actions: write
       contents: write
     steps:
       - name: Checkout source
@@ -65,8 +64,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Tag ${RELEASE_TAG} already exists."
+          existing_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}" | awk '{print $1}')"
+          if [[ -n "${existing_sha}" ]]; then
+            if [[ "${existing_sha}" != "${SOURCE_SHA}" ]]; then
+              echo "Tag ${RELEASE_TAG} already exists at ${existing_sha}, expected ${SOURCE_SHA}." >&2
+              exit 1
+            fi
+            echo "Tag ${RELEASE_TAG} already exists at the expected commit."
             exit 0
           fi
 
@@ -75,49 +79,44 @@ jobs:
           git tag "${RELEASE_TAG}" "${SOURCE_SHA}"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"
 
-      - name: Dispatch release build
-        id: dispatch
+      - name: Create published release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
         run: |
           set -euo pipefail
-          dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          gh workflow run build-release.yml \
-            --ref main \
-            -f git_ref="${RELEASE_TAG}" \
-            -f mode=publish \
-            -f release_tag="${RELEASE_TAG}"
 
-          run_id=""
-          for _ in $(seq 1 30); do
-            run_id="$(
-              gh run list \
-                --workflow build-release.yml \
-                --event workflow_dispatch \
-                --limit 10 \
-                --json databaseId,createdAt \
-                --jq "map(select(.createdAt >= \"${dispatched_at}\"))[0].databaseId"
-            )"
-            if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
-              break
-            fi
-            sleep 10
-          done
-
-          if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
-            echo "Unable to resolve the publish run id." >&2
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "GitHub Release ${RELEASE_TAG} already exists." >&2
             exit 1
           fi
 
-          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          notes_file="$(mktemp)"
+          cat > "${notes_file}" <<EOF
+          Home Assistant OS ${VERSION} for Mixtile Edge 2.
 
-      - name: Wait for publish result
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+          Source ref: ${{ inputs.git_ref }}
+          Source commit: ${SOURCE_SHA}
+
+          Publishing this release triggers the official-style build workflow, which uploads \`.img.xz\` and \`.raucb\` assets to this release.
+          EOF
+
+          gh release create "${RELEASE_TAG}" \
+            --verify-tag \
+            --title "Mixtile HAOS ${VERSION} r${REVISION}" \
+            --notes-file "${notes_file}"
+
+      - name: Write summary
         run: |
-          set -euo pipefail
-          gh run watch "${RUN_ID}" --exit-status
+          {
+            echo "# Release publication summary"
+            echo ""
+            echo "- Source ref: \`${{ inputs.git_ref }}\`"
+            echo "- Source SHA: \`${{ steps.source.outputs.source_sha }}\`"
+            echo "- Release tag: \`${{ steps.source.outputs.release_tag }}\`"
+            echo "- Next step: \`Build Mixtile Edge 2\` will start automatically from the release.published event"
+          } >> "$GITHUB_STEP_SUMMARY"

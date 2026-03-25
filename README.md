@@ -23,7 +23,7 @@
 
 ## Workflows
 
-- `Build Mixtile Edge 2`: validates any `git_ref`, or publishes a validated tag when `mode=publish`
+- `Build Mixtile Edge 2`: official-style prepare/build workflow; `workflow_dispatch` validates any `git_ref`, and `release.published` uploads release assets
 - `Sync latest HAOS release`: watches the latest official HAOS stable release and opens an issue when `main` is behind upstream
-- `Backfill major release`: validates one historical `port/<version>` branch at a time; the `port/<version>` branch must already be prepared and pushed
-- `Publish validated release`: tags a validated ref as `mixtile-haos-<version>-rN` and dispatches the publish build
+- `Backfill major release`: validates one historical `port/<version>` branch at a time by dispatching `Build Mixtile Edge 2` with `publish=false`
+- `Publish validated release`: tags a validated ref as `mixtile-haos-<version>-rN`, creates a published GitHub Release, and lets the release event drive the final asset build

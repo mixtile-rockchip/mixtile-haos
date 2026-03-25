@@ -15,16 +15,6 @@ on:
           - "15.2"
           - "16.3"
           - "17.1"
-      revision:
-        description: Release revision number for the selected HAOS version
-        required: true
-        type: string
-        default: "1"
-      force:
-        description: Rebuild even if the GitHub Release already exists
-        required: true
-        type: boolean
-        default: false
 
 jobs:
   validate:
@@ -50,28 +40,7 @@ jobs:
           set -euo pipefail
           git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "${GIT_REF}" >/dev/null
 
-      - name: Check existing release
-        id: existing
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE: ${{ inputs.force }}
-          RELEASE_TAG: mixtile-haos-${{ inputs.version }}-r${{ inputs.revision }}
-        run: |
-          set -euo pipefail
-          if [[ "${FORCE}" == "true" ]]; then
-            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Dispatch build workflow
-        if: ${{ steps.existing.outputs.should_dispatch == 'true' }}
         id: dispatch
         shell: bash
         env:
@@ -81,16 +50,16 @@ jobs:
           set -euo pipefail
           dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-          gh workflow run build-release.yml \
+          gh workflow run build.yml \
             --ref main \
             -f git_ref="${GIT_REF}" \
-            -f mode=validate
+            -f publish=false
 
           run_id=""
           for _ in $(seq 1 30); do
             run_id="$(
               gh run list \
-                --workflow build-release.yml \
+                --workflow build.yml \
                 --event workflow_dispatch \
                 --limit 10 \
                 --json databaseId,createdAt \
@@ -110,7 +79,6 @@ jobs:
           echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for validation result
-        if: ${{ steps.existing.outputs.should_dispatch == 'true' }}
         id: result
         shell: bash
         env:
@@ -133,8 +101,8 @@ jobs:
             echo ""
             echo "- Version: \`${{ inputs.version }}\`"
             echo "- Source branch: \`${{ steps.release.outputs.git_ref }}\`"
-            echo "- Dispatched: \`${{ steps.existing.outputs.should_dispatch == 'true' }}\`"
+            echo "- Dispatched: \`true\`"
             echo "- Validation run id: \`${{ steps.dispatch.outputs.run_id || 'n/a' }}\`"
-            echo "- Validation status: \`${{ steps.result.outputs.status || 'skipped' }}\`"
+            echo "- Validation status: \`${{ steps.result.outputs.status || 'failed' }}\`"
             echo "- Requirement: prepare and push \`${{ steps.release.outputs.git_ref }}\` before running this workflow"
           } >> "$GITHUB_STEP_SUMMARY"

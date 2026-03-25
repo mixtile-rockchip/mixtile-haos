@@ -1,0 +1,270 @@
+name: Build Mixtile Edge 2
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git ref to build (main, port/<version>, or a release tag)
+        required: true
+        type: string
+        default: main
+      publish:
+        description: Upload assets to an existing GitHub Release for the selected tag
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: mixtile-haos-build
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      haos_version: ${{ steps.source.outputs.haos_version }}
+      haos_major: ${{ steps.source.outputs.haos_major }}
+      publish_build: ${{ steps.publish.outputs.publish_build }}
+      release_upload_url: ${{ steps.publish.outputs.release_upload_url }}
+      build_container_image: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder@${{ steps.build_builder.outputs.digest }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.git_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve source metadata
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            source_ref="${{ github.event.release.tag_name }}"
+          else
+            source_ref="${{ inputs.git_ref }}"
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          haos_version="$(git -C haos describe --tags --exact-match 2>/dev/null || true)"
+          if [[ -z "${haos_version}" ]]; then
+            echo "haos/ must be pinned to an exact upstream HAOS release tag." >&2
+            exit 1
+          fi
+
+          haos_major="${haos_version%%.*}"
+
+          echo "source_ref=${source_ref}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "haos_version=${haos_version}" >> "$GITHUB_OUTPUT"
+          echo "haos_major=${haos_major}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve publish mode
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
+          HAOS_VERSION: ${{ steps.source.outputs.haos_version }}
+        run: |
+          set -euo pipefail
+
+          release_upload_url=""
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
+            if [[ ! "${SOURCE_REF}" =~ ${expected_pattern} ]]; then
+              echo "Release tag ${SOURCE_REF} does not match ${expected_pattern}." >&2
+              exit 1
+            fi
+
+            echo "publish_build=true" >> "$GITHUB_OUTPUT"
+            echo "release_upload_url=${{ github.event.release.upload_url }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${{ inputs.publish }}" != "true" ]]; then
+            echo "publish_build=false" >> "$GITHUB_OUTPUT"
+            echo "release_upload_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          expected_pattern="^mixtile-haos-${HAOS_VERSION}-r[1-9][0-9]*$"
+          if [[ ! "${SOURCE_REF}" =~ ${expected_pattern} ]]; then
+            echo "Manual publish requires a release tag matching ${expected_pattern}." >&2
+            exit 1
+          fi
+
+          release_upload_url="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_REF}" --jq '.upload_url'
+          )"
+
+          if [[ -z "${release_upload_url}" || "${release_upload_url}" == "null" ]]; then
+            echo "Unable to resolve release upload URL for ${SOURCE_REF}." >&2
+            exit 1
+          fi
+
+          echo "publish_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_upload_url=${release_upload_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push builder image
+        id: build_builder
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ./haos
+          file: ./haos/Dockerfile
+          tags: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder
+          cache-from: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder:cache-${{ steps.source.outputs.haos_major }}
+          cache-to: ghcr.io/${{ github.repository_owner }}/mixtile-haos-builder:cache-${{ steps.source.outputs.haos_major }}
+          push: true
+
+  build:
+    name: Build Mixtile Edge 2
+    needs: prepare
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      BR2_EXTERNAL_PATH: /build/haos/buildroot-external:/build/external
+      BUILD_CONFIG_COMMAND: >-
+        make -C /build/haos/buildroot
+        O=/build/output
+        BR2_EXTERNAL=/build/haos/buildroot-external:/build/external
+        mixtile_edge2_defconfig
+      BUILD_COMMAND: >-
+        make -C /build/haos/buildroot
+        O=/build/output
+        BR2_EXTERNAL=/build/haos/buildroot-external:/build/external
+        BR2_JLEVEL=2
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Free space on build drive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          df -h
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/cache /mnt/output
+          if [[ -e "${GITHUB_WORKSPACE}/output" && ! -L "${GITHUB_WORKSPACE}/output" ]]; then
+            rm -rf "${GITHUB_WORKSPACE}/output"
+          fi
+          sudo ln -sfn /mnt/output "${GITHUB_WORKSPACE}/output"
+          workspace_owner="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
+          sudo chown -R "${workspace_owner}" /mnt/cache /mnt/output
+          df -h
+
+      - name: "Restore cache: object files"
+        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: /mnt/cache/cc
+          key: mixtile-haos-cc-${{ needs.prepare.outputs.haos_version }}
+          restore-keys: |
+            mixtile-haos-cc-${{ needs.prepare.outputs.haos_major }}.
+            mixtile-haos-cc-
+
+      - name: Generate build config
+        uses: ./.github/actions/haos-builder-command
+        with:
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: ${{ env.BUILD_CONFIG_COMMAND }}
+
+      - name: Build image
+        uses: ./.github/actions/haos-builder-command
+        with:
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: ${{ env.BUILD_COMMAND }}
+
+      - name: Print cache stats
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -d /mnt/cache/cc ]]; then
+            echo "Cache size: $(du -sh /mnt/cache/cc)"
+            if [[ -f output/Makefile ]]; then
+              find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile -delete
+            fi
+            echo "Cache size after pruning: $(du -sh /mnt/cache/cc)"
+          fi
+
+      - name: "Save cache: object files"
+        if: ${{ success() }}
+        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: /mnt/cache/cc
+          key: mixtile-haos-cc-${{ needs.prepare.outputs.haos_version }}-${{ github.run_id }}
+
+      - name: Generate build summary
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GIT_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          HAOS_VERSION: ${{ needs.prepare.outputs.haos_version }}
+          PUBLISH_BUILD: ${{ needs.prepare.outputs.publish_build }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Mixtile Edge 2 build summary"
+            echo ""
+            echo "- Git ref: \`${GIT_REF}\`"
+            echo "- Source SHA: \`${SOURCE_SHA}\`"
+            echo "- HAOS version: \`${HAOS_VERSION}\`"
+            echo "- Publish build: \`${PUBLISH_BUILD}\`"
+            echo ""
+            echo "| File | Size (bytes) | Size (formatted) |"
+            echo "|:-|:-|:-|"
+            for artifact in output/images/haos_*; do
+              if [[ -e "${artifact}" ]]; then
+                echo "| $(basename "${artifact}") | $(du -b "${artifact}" | cut -f1) | $(du -bh "${artifact}" | cut -f1) |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release assets
+        if: ${{ success() && needs.prepare.outputs.publish_build == 'true' }}
+        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        with:
+          upload_url: ${{ needs.prepare.outputs.release_upload_url }}
+          asset_path: output/images/haos_*
+
+      - name: Upload validation artifacts
+        if: ${{ success() && needs.prepare.outputs.publish_build != 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mixtile-edge2-images-${{ needs.prepare.outputs.haos_version }}
+          path: |
+            output/images/*.img.xz
+            output/images/*.raucb
