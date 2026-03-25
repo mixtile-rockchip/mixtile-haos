@@ -21,6 +21,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: mixtile-haos-build-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -28,6 +32,9 @@ jobs:
       contents: write
     env:
       BR2_EXTERNAL_PATH: /build/haos/buildroot-external:/build/external
+      BUILD_LOG_PATH: ${{ runner.temp }}/build-log.txt
+      LATEST_PHASE_PATH: ${{ runner.temp }}/latest-build-phase.txt
+      BUILD_EXIT_CODE_PATH: ${{ runner.temp }}/build-exit-code.txt
     steps:
       - name: Checkout source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
@@ -87,22 +94,116 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           df -h
 
+      - name: Configure swap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! swapon --show | grep -q '^/swapfile'; then
+            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
+
+          free -h
+          swapon --show
+
       - name: Build Mixtile Edge 2 image
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$GITHUB_WORKSPACE/.cache" "$GITHUB_WORKSPACE/output"
+          : > "$BUILD_LOG_PATH"
+          : > "$LATEST_PHASE_PATH"
+          echo "0" > "$BUILD_EXIT_CODE_PATH"
+
+          filter_script="$RUNNER_TEMP/build-log-filter.py"
+          cat > "$filter_script" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          latest_phase_path = pathlib.Path(sys.argv[1])
+          summary_patterns = (
+              re.compile(r"^>>> "),
+              re.compile(r"^Finalizing "),
+              re.compile(r"^Generating "),
+              re.compile(r"^#\\d+ \\["),
+          )
+          error_pattern = re.compile(
+              r"(?i)(^error:|\\berror\\b|\\bfatal\\b|\\bfailed\\b|no rule to make target|permission denied|no such file|undefined reference)"
+          )
+
+          for raw in sys.stdin:
+              line = raw.rstrip("\\n")
+              if line.startswith(">>> "):
+                  latest_phase_path.write_text(line + "\\n", encoding="utf-8")
+                  print(line, flush=True)
+                  continue
+              if any(pattern.search(line) for pattern in summary_patterns):
+                  print(line, flush=True)
+                  continue
+              if error_pattern.search(line):
+                  print(line, flush=True)
+          PY
+
+          run_logged() {
+            local label="$1"
+            shift
+            local status
+
+            echo "[build] ${label}"
+            set +e
+            "$@" 2>&1 | tee -a "$BUILD_LOG_PATH" | python3 -u "$filter_script" "$LATEST_PHASE_PATH"
+            status=${PIPESTATUS[0]}
+            set -e
+            return "$status"
+          }
+
+          run_checked() {
+            local status
+
+            set +e
+            run_logged "$@"
+            status=$?
+            set -e
+
+            echo "${status}" > "$BUILD_EXIT_CODE_PATH"
+            if [[ "${status}" -ne 0 ]]; then
+              exit "${status}"
+            fi
+          }
+
+          heartbeat() {
+            while true; do
+              sleep 300
+              local latest_phase="n/a"
+              if [[ -s "$LATEST_PHASE_PATH" ]]; then
+                latest_phase="$(tr -d '\n' < "$LATEST_PHASE_PATH")"
+              fi
+              echo "[heartbeat] $(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=${latest_phase}"
+              df -h / /tmp | sed 's/^/[heartbeat] /'
+              free -h | sed 's/^/[heartbeat] /'
+            done
+          }
+
+          heartbeat &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" >/dev/null 2>&1 || true' EXIT
 
           haos_tag="$(git -C "$GITHUB_WORKSPACE/haos" describe --tags --exact-match 2>/dev/null || git -C "$GITHUB_WORKSPACE/haos" rev-parse --short HEAD)"
           builder_image="mixtile-haos-builder:${haos_tag}"
 
-          docker build \
+          run_checked "Build builder image ${builder_image}" \
+            docker build \
             -t "$builder_image" \
             -f "$GITHUB_WORKSPACE/haos/Dockerfile" \
             "$GITHUB_WORKSPACE/haos"
 
-          docker run --rm --privileged \
+          run_checked "Generate mixtile_edge2_defconfig" \
+            docker run --rm --privileged \
             -e BUILDER_UID="$(id -u)" \
             -e BUILDER_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/build" \
@@ -111,22 +212,72 @@ jobs:
             "$builder_image" \
             make -C /build/haos/buildroot O=/build/output BR2_EXTERNAL="${BR2_EXTERNAL_PATH}" mixtile_edge2_defconfig
 
-          docker run --rm --privileged \
+          run_checked "Build Mixtile Edge 2 image with BR2_JLEVEL=2" \
+            docker run --rm --privileged \
             -e BUILDER_UID="$(id -u)" \
             -e BUILDER_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/build" \
             -v "$GITHUB_WORKSPACE/.cache:/cache" \
             -v "$GITHUB_WORKSPACE/output:/build/output" \
             "$builder_image" \
-            make -C /build/haos/buildroot O=/build/output BR2_EXTERNAL="${BR2_EXTERNAL_PATH}"
+            make -C /build/haos/buildroot O=/build/output BR2_EXTERNAL="${BR2_EXTERNAL_PATH}" BR2_JLEVEL=2
 
       - name: Upload image artifacts
+        if: ${{ success() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: mixtile-edge2-images
           path: |
             output/images/*.img.xz
             output/images/*.raucb
+
+      - name: Upload build log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build-log.txt
+          if-no-files-found: warn
+
+      - name: Write build summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          exit_code="n/a"
+          latest_phase="n/a"
+
+          if [[ -f "$BUILD_EXIT_CODE_PATH" ]]; then
+            exit_code="$(cat "$BUILD_EXIT_CODE_PATH")"
+          fi
+
+          if [[ -s "$LATEST_PHASE_PATH" ]]; then
+            latest_phase="$(tr -d '\n' < "$LATEST_PHASE_PATH")"
+          fi
+
+          {
+            echo "# Build summary"
+            echo ""
+            echo "- Git ref: \`${{ inputs.git_ref }}\`"
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- Exit code: \`${exit_code}\`"
+            echo "- Latest phase: \`${latest_phase}\`"
+            echo "- Full log artifact: \`build-log\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${exit_code}" != "0" && -f "$BUILD_LOG_PATH" ]]; then
+            {
+              echo ""
+              echo "## Last 100 key log lines"
+              echo ""
+              echo '```text'
+              if ! rg -i '(^>>> |^Finalizing |^Generating |error:|fatal:|failed|no rule to make target|permission denied|no such file|undefined reference)' "$BUILD_LOG_PATH" | tail -n 100; then
+                tail -n 100 "$BUILD_LOG_PATH"
+              fi
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload release assets
         if: ${{ inputs.mode == 'publish' }}
