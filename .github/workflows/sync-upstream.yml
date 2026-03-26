@@ -1,4 +1,10 @@
 name: Sync latest HAOS release
+run-name: >-
+  ${{
+    inputs.version != '' &&
+    format('Sync HAOS {0}', inputs.version) ||
+    'Sync HAOS latest'
+  }}
 
 on:
   workflow_dispatch:
@@ -112,6 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          expected_title="Build ${SYNC_BRANCH}"
 
           gh workflow run build.yml \
             --ref main \
@@ -124,9 +131,11 @@ jobs:
               gh run list \
                 --workflow build.yml \
                 --event workflow_dispatch \
-                --limit 10 \
-                --json databaseId,createdAt \
-                --jq "map(select(.createdAt >= \"${dispatched_at}\"))[0].databaseId"
+                --limit 30 \
+                --json databaseId,createdAt,displayTitle \
+                | jq -r --arg dispatched_at "${dispatched_at}" --arg expected_title "${expected_title}" '
+                    map(select(.createdAt >= $dispatched_at and .displayTitle == $expected_title))[0].databaseId // empty
+                  '
             )"
             if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
               break

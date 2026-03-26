@@ -1,4 +1,5 @@
 name: Backfill major release
+run-name: Backfill ${{ inputs.version }}
 
 on:
   workflow_dispatch:
@@ -7,14 +8,6 @@ on:
         description: Historical HAOS version from .github/major-targets.json
         required: true
         type: string
-      runner_target:
-        description: Choose GitHub-hosted or the dedicated self-hosted runner
-        required: true
-        type: choice
-        default: github-hosted
-        options:
-          - github-hosted
-          - self-hosted
 
 jobs:
   validate:
@@ -59,15 +52,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REF: ${{ steps.release.outputs.source_ref }}
-          RUNNER_TARGET: ${{ inputs.runner_target }}
         run: |
           set -euo pipefail
           dispatched_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          expected_title="Build ${SOURCE_REF}"
 
           gh workflow run build.yml \
             --ref main \
             -f source_ref="${SOURCE_REF}" \
-            -f runner_target="${RUNNER_TARGET}" \
             -f publish_to_release=false
 
           run_id=""
@@ -76,9 +68,11 @@ jobs:
               gh run list \
                 --workflow build.yml \
                 --event workflow_dispatch \
-                --limit 10 \
-                --json databaseId,createdAt \
-                --jq "map(select(.createdAt >= \"${dispatched_at}\"))[0].databaseId"
+                --limit 30 \
+                --json databaseId,createdAt,displayTitle \
+                | jq -r --arg dispatched_at "${dispatched_at}" --arg expected_title "${expected_title}" '
+                    map(select(.createdAt >= $dispatched_at and .displayTitle == $expected_title))[0].databaseId // empty
+                  '
             )"
             if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
               break
@@ -117,7 +111,6 @@ jobs:
             echo "- Version: \`${{ inputs.version }}\`"
             echo "- Family: \`${{ steps.release.outputs.family }}\`"
             echo "- Source ref: \`${{ steps.release.outputs.source_ref }}\`"
-            echo "- Runner target: \`${{ inputs.runner_target }}\`"
             echo "- Validation run id: \`${{ steps.dispatch.outputs.run_id || 'n/a' }}\`"
             echo "- Validation status: \`${{ steps.result.outputs.status || 'failed' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

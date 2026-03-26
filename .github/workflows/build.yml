@@ -1,4 +1,10 @@
 name: Build Mixtile Edge 2
+run-name: >-
+  ${{
+    inputs.publish_to_release &&
+    format('Build {0}', inputs.release_tag) ||
+    format('Build {0}', inputs.source_ref)
+  }}
 
 on:
   workflow_dispatch:
@@ -8,14 +14,6 @@ on:
         required: true
         type: string
         default: main
-      runner_target:
-        description: Choose GitHub-hosted or the dedicated self-hosted runner
-        required: true
-        type: choice
-        default: github-hosted
-        options:
-          - github-hosted
-          - self-hosted
       publish_to_release:
         description: Upload assets to an existing draft GitHub Release
         required: true
@@ -30,7 +28,7 @@ on:
 jobs:
   prepare:
     name: Prepare build
-    runs-on: ${{ fromJSON(inputs.runner_target == 'self-hosted' && '["self-hosted","linux","x64","mixtile-haos"]' || '"ubuntu-22.04"') }}
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       packages: write
@@ -39,7 +37,6 @@ jobs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       haos_version: ${{ steps.source.outputs.haos_version }}
       haos_major: ${{ steps.source.outputs.haos_major }}
-      runner_target: ${{ steps.source.outputs.runner_target }}
       publish_build: ${{ steps.publish.outputs.publish_build }}
       release_tag: ${{ steps.publish.outputs.release_tag }}
       release_upload_url: ${{ steps.publish.outputs.release_upload_url }}
@@ -66,7 +63,6 @@ jobs:
         shell: bash
         env:
           SOURCE_REF: ${{ inputs.source_ref }}
-          RUNNER_TARGET: ${{ inputs.runner_target }}
         run: |
           set -euo pipefail
 
@@ -88,7 +84,6 @@ jobs:
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
           echo "haos_version=${haos_version}" >> "$GITHUB_OUTPUT"
           echo "haos_major=${haos_version%%.*}" >> "$GITHUB_OUTPUT"
-          echo "runner_target=${RUNNER_TARGET}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve publish mode
         id: publish
@@ -162,8 +157,8 @@ jobs:
   build:
     name: Build Mixtile Edge 2
     needs: prepare
-    runs-on: ${{ fromJSON(needs.prepare.outputs.runner_target == 'self-hosted' && '["self-hosted","linux","x64","mixtile-haos"]' || '"ubuntu-22.04"') }}
-    timeout-minutes: ${{ needs.prepare.outputs.runner_target == 'self-hosted' && 1440 || 360 }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
     permissions:
       contents: write
     env:
@@ -193,8 +188,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Prepare build directories on GitHub-hosted runner
-        if: ${{ needs.prepare.outputs.runner_target != 'self-hosted' }}
+      - name: Prepare build directories
         shell: bash
         run: |
           set -euo pipefail
@@ -211,23 +205,7 @@ jobs:
           sudo chown -R "${workspace_owner}" /mnt/cache /mnt/output
           df -h
 
-      - name: Prepare build directories on self-hosted runner
-        if: ${{ needs.prepare.outputs.runner_target == 'self-hosted' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          df -h
-          mkdir -p /mnt/cache/cc /mnt/output
-          find /mnt/output -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-          if [[ -e "${GITHUB_WORKSPACE}/output" && ! -L "${GITHUB_WORKSPACE}/output" ]]; then
-            rm -rf "${GITHUB_WORKSPACE}/output"
-          fi
-          ln -sfn /mnt/output "${GITHUB_WORKSPACE}/output"
-          df -h
-
       - name: "Restore cache: object files"
-        if: ${{ needs.prepare.outputs.runner_target != 'self-hosted' }}
         uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: /mnt/cache/cc
@@ -263,7 +241,7 @@ jobs:
           fi
 
       - name: "Save cache: object files"
-        if: ${{ success() && needs.prepare.outputs.runner_target != 'self-hosted' }}
+        if: ${{ success() }}
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: /mnt/cache/cc
@@ -293,7 +271,6 @@ jobs:
           SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           HAOS_VERSION: ${{ needs.prepare.outputs.haos_version }}
-          RUNNER_TARGET: ${{ needs.prepare.outputs.runner_target }}
           PUBLISH_BUILD: ${{ needs.prepare.outputs.publish_build }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
@@ -306,7 +283,6 @@ jobs:
             echo "- Source ref: \`${SOURCE_REF}\`"
             echo "- Source SHA: \`${SOURCE_SHA}\`"
             echo "- HAOS version: \`${HAOS_VERSION}\`"
-            echo "- Runner target: \`${RUNNER_TARGET}\`"
             echo "- Publish build: \`${PUBLISH_BUILD}\`"
             if [[ -n "${RELEASE_TAG}" ]]; then
               echo "- Release tag: \`${RELEASE_TAG}\`"
