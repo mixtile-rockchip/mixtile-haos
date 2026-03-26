@@ -26,8 +26,8 @@
 
 ## Workflows
 
-- `Build Mixtile Edge 2`: the single build engine; it always runs from workflow code on `main`, but checks the actual build source out into `source/`
-- `Backfill major release`: validates one historical `port/<version>` branch at a time using `.github/major-targets.json`
+- `Build Mixtile Edge 2`: the single build engine; it always runs from workflow code on `main`, checks the actual build source out into `source/`, and can target either `github-hosted` or the dedicated `self-hosted` runner
+- `Backfill major release`: validates one historical `port/<version>` branch at a time using `.github/major-targets.json`, and can route that validation to either runner target
 - `Publish validated release`: tags a validated ref as `mixtile-haos-<haos-version>-r<revision>`, creates or updates a draft release, and uploads assets to that draft release
 - `Finalize release`: publishes a board-validated draft release and deletes the matching `port/<version>` branch
 - `Sync latest HAOS release`: creates `sync/<version>`, dispatches validate, and opens or updates a PR back to `main`

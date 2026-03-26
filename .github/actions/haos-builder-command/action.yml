@@ -12,9 +12,17 @@ runs:
     - name: Run command in builder container
       shell: bash
       run: |
+        proxy_args=()
+        for proxy_var in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+          if [[ -n "${!proxy_var:-}" ]]; then
+            proxy_args+=(-e "${proxy_var}=${!proxy_var}")
+          fi
+        done
+
         docker run --rm --privileged \
           -e BUILDER_UID="$(id -u)" \
           -e BUILDER_GID="$(id -g)" \
+          "${proxy_args[@]}" \
           -v "${GITHUB_WORKSPACE}:/build" \
           -v "/mnt/cache:/cache" \
           -v "/mnt/output:/build/output" \
