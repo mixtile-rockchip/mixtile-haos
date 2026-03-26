@@ -223,14 +223,12 @@ jobs:
           set -euo pipefail
 
           df -h
-          sudo mkdir -p /mnt/cache/cc /mnt/output
-          sudo find /mnt/output -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          mkdir -p /mnt/cache/cc /mnt/output
+          find /mnt/output -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
           if [[ -e "${GITHUB_WORKSPACE}/output" && ! -L "${GITHUB_WORKSPACE}/output" ]]; then
             rm -rf "${GITHUB_WORKSPACE}/output"
           fi
-          sudo ln -sfn /mnt/output "${GITHUB_WORKSPACE}/output"
-          workspace_owner="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          sudo chown -R "${workspace_owner}" /mnt/cache /mnt/output
+          ln -sfn /mnt/output "${GITHUB_WORKSPACE}/output"
           df -h
 
       - name: "Restore cache: object files"
