@@ -1,22 +1,17 @@
-name: Publish validated release
-run-name: Publish ${{ inputs.version }} r${{ inputs.revision }}
+name: Publish release
+run-name: Publish ${{ inputs.version }}
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Validated source ref to publish (main or port/<version>)
+        description: Source ref to publish (main or port/<version>)
         required: true
         type: string
       version:
-        description: HAOS version pinned in source/haos
+        description: Stable HAOS version pinned in source/haos
         required: true
         type: string
-      revision:
-        description: Release revision number for this HAOS version
-        required: true
-        type: string
-        default: "1"
 
 jobs:
   publish:
@@ -46,7 +41,6 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
 
@@ -64,10 +58,9 @@ jobs:
           fi
 
           source_sha="$(git -C source rev-parse HEAD)"
-          release_tag="mixtile-haos-${VERSION}-r${REVISION}"
 
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Create tag if missing
         shell: bash
@@ -84,7 +77,6 @@ jobs:
               echo "Tag ${RELEASE_TAG} already exists at ${existing_sha}, expected ${SOURCE_SHA}." >&2
               exit 1
             fi
-            echo "Tag ${RELEASE_TAG} already exists at the expected commit."
             exit 0
           fi
 
@@ -93,14 +85,13 @@ jobs:
           git tag "${RELEASE_TAG}" "${SOURCE_SHA}"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"
 
-      - name: Create or update draft release
+      - name: Create or update release
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REF: ${{ inputs.source_ref }}
           VERSION: ${{ inputs.version }}
-          REVISION: ${{ inputs.revision }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
         run: |
@@ -112,27 +103,17 @@ jobs:
             printf '\n'
             printf '%s\n' "Source ref: ${SOURCE_REF}"
             printf '%s\n' "Source commit: ${SOURCE_SHA}"
-            printf '\n'
-            printf '%s\n' "This release remains a draft until board validation is complete."
           } > "${notes_file}"
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq '.isDraft')"
-            if [[ "${is_draft}" != "true" ]]; then
-              echo "Release ${RELEASE_TAG} already exists and is not a draft." >&2
-              exit 1
-            fi
-
             gh release edit "${RELEASE_TAG}" \
-              --draft \
-              --title "Mixtile HAOS ${VERSION} r${REVISION}" \
+              --title "Mixtile Edge 2 HAOS ${VERSION}" \
               --notes-file "${notes_file}"
           else
             gh release create "${RELEASE_TAG}" \
               --verify-tag \
-              --draft \
               --target "${SOURCE_SHA}" \
-              --title "Mixtile HAOS ${VERSION} r${REVISION}" \
+              --title "Mixtile Edge 2 HAOS ${VERSION}" \
               --notes-file "${notes_file}"
           fi
 
@@ -189,16 +170,31 @@ jobs:
           set -euo pipefail
           gh run watch "${RUN_ID}" --exit-status
 
+      - name: Delete temporary port branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${SOURCE_REF}" != port/* ]]; then
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "${SOURCE_REF}" >/dev/null 2>&1; then
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ":refs/heads/${SOURCE_REF}"
+          fi
+
       - name: Write summary
         if: always()
         run: |
           {
-            echo "# Draft release summary"
+            echo "# Release summary"
             echo ""
             echo "- Source ref: \`${{ inputs.source_ref }}\`"
             echo "- Source SHA: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- Release tag: \`${{ steps.source.outputs.release_tag }}\`"
-            echo "- Draft release: \`${{ steps.release.outputs.release_url || 'n/a' }}\`"
+            echo "- Release URL: \`${{ steps.release.outputs.release_url || 'n/a' }}\`"
             echo "- Build run id: \`${{ steps.dispatch.outputs.run_id || 'n/a' }}\`"
-            echo "- Next step: board-validate this draft release, then run \`Finalize release\`"
           } >> "$GITHUB_STEP_SUMMARY"
