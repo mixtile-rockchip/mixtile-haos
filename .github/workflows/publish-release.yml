@@ -168,7 +168,26 @@ jobs:
           RUN_ID: ${{ steps.dispatch.outputs.run_id }}
         run: |
           set -euo pipefail
-          gh run watch "${RUN_ID}" --exit-status
+
+          for _ in $(seq 1 120); do
+            run_json="$(gh run view "${RUN_ID}" --json status,conclusion)"
+            status="$(jq -r '.status' <<<"${run_json}")"
+            conclusion="$(jq -r '.conclusion // empty' <<<"${run_json}")"
+
+            if [[ "${status}" == "completed" ]]; then
+              if [[ "${conclusion}" == "success" ]]; then
+                exit 0
+              fi
+
+              echo "Release build ${RUN_ID} completed with conclusion=${conclusion}." >&2
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "Timed out waiting for release build ${RUN_ID}." >&2
+          exit 1
 
       - name: Delete temporary port branch
         shell: bash
