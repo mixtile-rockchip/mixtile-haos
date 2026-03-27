@@ -155,6 +155,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write
+      packages: read
     env:
       BUILD_CONFIG_COMMAND: >-
         make -C /build/source/haos/buildroot
@@ -207,6 +208,13 @@ jobs:
           restore-keys: |
             mixtile-haos-cc-${{ needs.prepare.outputs.haos_major }}-
             mixtile-haos-cc-
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate build config
         uses: ./.github/actions/haos-builder-command
