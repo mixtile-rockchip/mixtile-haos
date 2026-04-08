@@ -11,9 +11,8 @@
 
 ## Branch model
 
-- `main`: the only long-lived branch, always tracking the latest stable HAOS release line
+- `main`: the only long-lived branch, updated directly by sync automation to the latest stable HAOS release line
 - `port/<version>`: temporary frozen-release or next-major adaptation branch, currently `port/15.2`, `port/16.3`, and `port/17.1`
-- `sync/<version>`: temporary branch created by automation when upstream HAOS stable moves ahead of `main`
 - release tags: stable HAOS version tags such as `15.2`, `16.3`, and `17.1`
 
 ## Release policy
@@ -28,4 +27,4 @@
 
 - `Build Mixtile Edge 2`: the single build engine; it runs from workflow code on `main`, checks the actual build source out into `source/`, and either uploads validation artifacts or attaches assets to an existing release
 - `Publish release`: tags a validated ref with the stable HAOS version, creates or updates the GitHub release, uploads assets, and deletes the matching `port/<version>` branch
-- `Sync latest HAOS release`: creates `sync/<version>` and opens or updates a PR back to `main`
+- `Sync latest HAOS release`: updates `main` directly to the latest stable HAOS release (or a manually specified stable version)

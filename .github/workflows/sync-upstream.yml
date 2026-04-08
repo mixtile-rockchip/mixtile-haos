@@ -15,7 +15,7 @@ on:
         type: string
         default: ""
       force:
-        description: Force regenerating the sync/<version> branch and validate run even when main is already pinned there
+        description: Force running sync even when main is already pinned to the target release
         required: true
         type: boolean
         default: false
@@ -27,7 +27,6 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-      pull-requests: write
     steps:
       - name: Checkout main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -73,73 +72,31 @@ jobs:
 
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
           echo "target_tag=${target_tag}" >> "$GITHUB_OUTPUT"
-          echo "sync_branch=sync/${target_tag}" >> "$GITHUB_OUTPUT"
           echo "should_sync=${should_sync}" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare sync branch
+      - name: Update main to target tag
         if: ${{ steps.versions.outputs.should_sync == 'true' }}
-        id: branch
+        id: sync
         shell: bash
         env:
           TARGET_TAG: ${{ steps.versions.outputs.target_tag }}
-          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          git switch -C "${SYNC_BRANCH}" main
+          git switch main
           git -C haos fetch --tags --force origin
           git -C haos checkout "${TARGET_TAG}"
           git add haos
 
           if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            git commit -m "Sync HAOS ${TARGET_TAG}"
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: Push sync branch
-        if: ${{ steps.versions.outputs.should_sync == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
-        run: |
-          set -euo pipefail
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${SYNC_BRANCH}" --force-with-lease
-
-      - name: Create or update pull request
-        if: ${{ steps.versions.outputs.should_sync == 'true' && steps.branch.outputs.has_changes == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_TAG: ${{ steps.versions.outputs.current_tag }}
-          TARGET_TAG: ${{ steps.versions.outputs.target_tag }}
-          SYNC_BRANCH: ${{ steps.versions.outputs.sync_branch }}
-        run: |
-          set -euo pipefail
-
-          body_file="$(mktemp)"
-          {
-            printf '%s\n' "Automated HAOS sync candidate for ${TARGET_TAG}."
-            printf '\n'
-            printf '%s\n' "Current main HAOS tag: ${CURRENT_TAG:-unversioned}"
-            printf '%s\n' "Proposed HAOS tag: ${TARGET_TAG}"
-            printf '\n'
-            printf '%s\n' "Review the branch and run a validate build manually before merging."
-          } > "${body_file}"
-
-          existing_pr="$(gh pr list --base main --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number')"
-          if [[ -n "${existing_pr}" && "${existing_pr}" != "null" ]]; then
-            gh pr edit "${existing_pr}" \
-              --title "Sync HAOS ${TARGET_TAG}" \
-              --body-file "${body_file}"
-          else
-            gh pr create \
-              --base main \
-              --head "${SYNC_BRANCH}" \
-              --title "Sync HAOS ${TARGET_TAG}" \
-              --body-file "${body_file}"
-          fi
+          git commit -m "Sync HAOS ${TARGET_TAG}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
 
       - name: Write summary
         if: always()
@@ -149,6 +106,6 @@ jobs:
             echo ""
             echo "- Current main tag: \`${{ steps.versions.outputs.current_tag || 'unversioned' }}\`"
             echo "- Target tag: \`${{ steps.versions.outputs.target_tag }}\`"
-            echo "- Sync branch: \`${{ steps.versions.outputs.sync_branch }}\`"
             echo "- Triggered sync: \`${{ steps.versions.outputs.should_sync }}\`"
+            echo "- Main updated: \`${{ steps.sync.outputs.has_changes || 'false' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
