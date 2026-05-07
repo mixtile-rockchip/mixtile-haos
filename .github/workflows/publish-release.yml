@@ -169,10 +169,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          for _ in $(seq 1 120); do
+          # Build workflow timeout is 360 minutes; keep an additional 30-minute buffer
+          # so publish does not fail when build completes near the timeout boundary.
+          poll_interval_seconds=30
+          max_wait_seconds=$(((360 + 30) * 60))
+          max_attempts=$((max_wait_seconds / poll_interval_seconds))
+
+          for attempt in $(seq 1 "${max_attempts}"); do
             run_json="$(gh run view "${RUN_ID}" --json status,conclusion)"
             status="$(jq -r '.status' <<<"${run_json}")"
             conclusion="$(jq -r '.conclusion // empty' <<<"${run_json}")"
+            echo "Release build ${RUN_ID}: status=${status}, conclusion=${conclusion:-none} (attempt ${attempt}/${max_attempts})"
 
             if [[ "${status}" == "completed" ]]; then
               if [[ "${conclusion}" == "success" ]]; then
@@ -183,10 +190,10 @@ jobs:
               exit 1
             fi
 
-            sleep 30
+            sleep "${poll_interval_seconds}"
           done
 
-          echo "Timed out waiting for release build ${RUN_ID}." >&2
+          echo "Timed out waiting for release build ${RUN_ID} after ${max_wait_seconds} seconds." >&2
           exit 1
 
       - name: Delete temporary port branch
