@@ -89,7 +89,7 @@ index 0000000000..d2cf31c776
 @@ -0,0 +1,44 @@
 +// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 +/dts-v1/;
-+#include "rk356x.dtsi"
++#include "rk3568.dtsi"
 +
 +/ {
 +	model = "Mixtile Edge 2";
